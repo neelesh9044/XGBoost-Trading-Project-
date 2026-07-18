@@ -1,0 +1,286 @@
+---
+
+title: "Machine learning with R: Final Individual Project"
+author: "Neelesh Kumar"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    code_folding: show
+    
+---
+
+
+# Section 1: Setup & Local Data Loading
+
+This is the initial step of the project wherein we load the data (Rdata file provided by you) in order to start working on the model.
+
+```{r}
+
+# 1. Since we are using various packages, I havd used "pacman" package library functionality of R to make my life easier :) - Used LLM to find out this functionality.
+
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, tidymodels, xgboost, PerformanceAnalytics, lubridate)
+
+# 2. Loading of data/CSV file:
+
+file_name <- "spx_macro.RData"
+load(file_name)
+  
+```
+
+
+# Section 2: Data Cleaning
+
+As instructed and required, we generate a balanced dataset. Initially, when I used the balancing code provided by you in the document I was getting mainly 2 error further in my codes.
+
+1. We were not left with enough Training and Testing data for my model to function (Due to strict balancing of data).
+2. There were few issues in reading of dates by my model.
+
+In order to fix the issue, I have used lubridate package to manage any date formatting errors and have also relaxed the "survivor bias" filter to ensure we have enough training data.
+
+```{r}
+
+# 1. Fix Date Formats: Using lubridate to handle any date format (Text, Number, or Date) and then sort the entire dataset, first chronologically (oldest to newest) and then alphabetically by stock symbol.
+
+spx_macro <- spx_macro |>
+  mutate(
+    date = case_when(
+      is.numeric(date) ~ ymd(as.character(date)), # Handles 20200101
+      is.character(date) ~ ymd(date),             # Handles "2020-01-01"
+      TRUE ~ as.Date(date)                        # Handles Date objects
+    )) |>
+  arrange(date, symbol)
+
+# 2. Balancing: Since I was getting "0 Rows" error caused by strict balancing, we keep any stock with at least 10 years (120 months) of data.
+
+data_balanced <- spx_macro |>
+  group_by(symbol) |>
+  mutate(n = n()) |>
+  ungroup() |>
+  filter(n >= 120) |>
+  select(-n)
+
+print(paste("Data Loaded. Total Rows:", nrow(data_balanced)))
+
+```
+
+
+# Section 3: Defining model training strategy
+
+The objective is to select/target "High Quality Stocks", accordingly we code our strategy as below:
+
+```{r}
+
+# 1. We define function to sum up the last n months of returns to create a "Momentum score" to be used for training our model later.
+
+momentum_rolling <- function(x, n) 
+  {stats::filter(x, rep(1, n), sides = 1) |> as.numeric()}
+
+# 2. We then calculate the average return of all stocks available. This gives us the benchmark.
+
+ml_data <- data_balanced |>
+  group_by(date) |>
+  mutate(mkt_avg.ret = mean(fwd_return, na.rm = TRUE)) |>
+  ungroup() |>
+  group_by(symbol) |>
+  arrange(date) |>
+  
+# 3. Our trainig strategy: Selecting "High Quality" stocks i.e. companies having high profit margins and that are already moving up (having high momentum). We make an assumtion that these stocks will continue to outperform.
+  
+  mutate(
+    # Our Target Return: Excess return that beats the market. This will provide us the Alpha.
+    target = fwd_return - mkt_avg.ret,
+    
+    # Second layer i.e. Momentum Features/Trend: We apply our rolling tool to create 6-month and 12-month trends 
+    trend_6m  = momentum_rolling(return, 6),
+    trend_12m = momentum_rolling(return, 12),
+    
+    # Combine Profitability with Momentum. It creates a signal that is high only if a company is both profitable and trending up
+    quality_signal = profit_margin * trend_6m) |>
+  
+  ungroup() |>
+  tidyr::drop_na(target, trend_12m) # Remove rows with missing data
+
+# 4. Now we split data into two parts i.e. in order to train the model we use with data upto 2018 and subsequently, we will test our trained model  on the post-2018 data to see if our trading strategy actually works on new and unseen days/data. (Train: Pre-2018 | Test: 2018-2025)
+
+date_cutoff <- as.Date("2018-01-01")
+training_set <- ml_data |> filter(date < date_cutoff)
+test_data  <- ml_data |> filter(date >= date_cutoff)
+
+print(paste("Total number of training Rows:", nrow(training_set))) # Prints the message, upon successful training
+
+```
+
+
+# Section 4: Model training (using XGBoost)
+
+We are taking the clean data from the previous section and teaching an XGBoost (Extreme Gradient Boosting) algorithm to recognize patterns. Hence we will be using XGBoost model to train data. 
+
+I chose XGBoost because of the fact that the financial factors often interact in non-linear ways that simple regression cannot capture. While Random Forest, Deep Learning was an option, XGBoost is more presise and offers the best balance of accuracy and interpretability for tabular stock data.
+
+```{r}
+
+# Upon execution of codes in this section, R was showing "Warning" of few data missing i.e. NaN. We scrub the data one last time before it enters the training model (Used LLM to look for the solution, to fix the warning)
+
+training_set <- training_set |>
+  mutate(across(where(is.numeric), ~ifelse(is.infinite(.) | is.nan(.), NA, .)))
+
+# 1. Defining Recipe for the model to train (A step-by-step pipeline to transform raw data into a matrix of numbers).
+
+model_preprocessing <- recipe(target ~ ., data = training_set) |>
+  
+  step_rm(date, symbol, return, fwd_return, mkt_avg.ret) |> # Remove columns like date, symbol, return, fwd_return and mkt_avg.ret 
+  
+  step_unknown(sector) |> # Handle missing sectors
+  
+  step_impute_median(all_numeric_predictors()) |> # Fills any NAs (created by our cleaning above) with the median
+  
+  step_zv(all_predictors()) |> # This step automatically removes any column that has Zero Variance (i.e. its constant)
+
+  # We normalize the data:
+  
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) |> # Converts text categories (Sector) into math (1s and 0s)
+  
+  step_normalize(all_numeric_predictors()) # Scales numbers between roughly -3 and +3 (Z-scores) which ensures that "Market Cap doesn't overpower "Profit Margin".
+
+# 2. We now set up the XGBoost model. 
+
+boost_model_config <- boost_tree(
+  trees = 150,          # Build 150 different decision trees
+  tree_depth = 6,       # Allow each tree to ask up to 6 Yes/No questions deep
+  min_n = 10,           # Minimum node size
+  learn_rate = 0.05) |> # Asking to learn slowly so that the model dosen't jump to conclusions too fast 
+  
+  set_engine("xgboost") |> 
+  set_mode("regression")
+
+# 3. Finally, we train the model.
+
+set.seed(2025)
+trained_workflow <- workflow() |>
+  add_recipe(model_preprocessing) |>
+  add_model(boost_model_config) |>
+  fit(data = training_set)
+
+print("XGBoost training complete.") # Prints the message, upon successful training
+
+```
+
+
+# Section 5: Dynamic trading strategy (Execution)
+
+This is the "Simulation" phase where we test if the above model would have actually made money in the real world (On the dataset post 2018). We build a trading system and apply below rules to the above model predictions to construct a wining portfolio. The Strategy goes as: 
+
+ # Rank: Predict Alpha for all stocks in the dataset.
+
+ # Select: Buy only the Top 5% (For which our model has the high conviction).
+
+ # Hedge: We also apply Macroeconomics (Inflation) as a safety switch. If inflation is high (>4%), the market is usually dangerous. The code       automatically moves 20% of the portfolio into Cash (Safe) and only invests 80% in stocks. If Inflation is high (>4%), hold 20% Cash to reduce volatility.
+
+ # Brokerage cost: We subtract 0.1% (10 basis points) from every trade to account for fees and slippage.
+ 
+```{r}
+
+# 1. We generate scores by taking the above trained model and run simulation on the test_data.
+
+model_scores <- predict(trained_workflow, new_data = test_data) |>
+  bind_cols(test_data)
+
+# 2. We now apply our trading rules 
+
+backtest_summary <- model_scores |>
+  group_by(date) |>
+  mutate(
+    rank = percent_rank(.pred), # Group the data by Date. For each month, rank the stocks from 0 to 1 based on the model's prediction.
+    
+    # Macroeconomics Risk Control:
+    # If inflation is high, reduce position_weight to 0.8 (20% Cash)
+    position_weight = ifelse(mean(inflation) > 4, 0.8, 1.0),
+    
+    # Stock Selection:
+    # Buy Top 5% Only (Aggressive)
+    is_selected = ifelse(rank >= 0.95, 1, 0),
+    
+    # Calculate Component Returns (adjusted for position size):
+    # (Stock Return * Exposure) - Transaction Cost (0.1%)
+    strat_ret = (is_selected * fwd_return * position_weight)) |>
+
+# 3. We finally aggregate the performance (Portfolio Return: Average of selected stocks minus 10bps transaction fee)
+  
+  summarise(
+    My_Strategy = mean(strat_ret[is_selected == 1], na.rm = TRUE) - 0.001,
+    Market   = mean(fwd_return, na.rm = TRUE)) |> # Simple market average
+  
+  ungroup()
+
+# 4. Create Time Series for Plotting
+
+performance_xts <- xts(backtest_summary %>% select(My_Strategy, Market), # Convert to time-series object
+                order.by = backtest_summary$date)
+
+```
+
+
+# Section 6: Generating the Performance Metrics & Plots
+
+We compare our strategy against the market benchmark to interpret and validate statistically and how our model has performed against market returns in terms of Return, Risk, and Consistency.
+
+```{r}
+
+# 1. We create a comparative performance table of metrics
+
+print(table.AnnualizedReturns(performance_xts, scale = 12, Rf = 0.003)) # Risk free rate assumed to be 3%
+
+# 2. We then do a detailed risk analysis 
+
+cat(paste("Max Drawdown:", round(maxDrawdown(performance_xts$My_Strategy), 4), "\n")) # Calculate worst-case decline (Drawdown)
+cat(paste("CAPM Beta:   ", round(CAPM.beta(performance_xts$My_Strategy, performance_xts$Market), 4), "\n")) # Calculate market sensitivity (Beta)
+
+# 3. Finally we visualize the cumulative wealth and drawdown history as Wealth plot
+
+charts.PerformanceSummary(performance_xts, 
+                          main = "Aggressive Top 5% My_Strategy (Blue) vs Market",  # Plot the "Wealth Index" (Growth of $1 investment)
+                          colorset = c("blue", "gray"),
+                          wealth.index = TRUE)
+
+```
+
+# Section 7: The summary and interpretation of the above results:
+
+1. Profitability (Annualized Return)
+
+   Result: My strategy earned 18.05% per year vs. the Market’s 11.91%.
+
+   Interpretation: This is a strong success validation for the Machine Learning model used above. Over the test period (2018–2025), my algorithm   identified "Quality Momentum" stocks that significantly outperformed the average S&P 500 company. Compounded over 7 years, this difference leads to much higher total wealth.
+
+2. Risk Profile (Standard Deviation & Beta)
+
+   Standard Deviation: My strategy (30.23%) is almost double the volatility of the Market (16.99%). This is due to the fact that I have an aggressive trading strategy.
+  
+   CAPM Beta: The Beta is 1.603.
+
+   Interpretation: A Beta of 1.6 means my portfolio is highly sensitive to market movements. If the market goes up 1%, my portfolio tends to go up 1.6%. If the market drops 1%, my portfolio tends to drop 1.6%.
+
+   This confirms your strategy is "Aggressive." It acts like a leveraged bet on the economy without actually borrowing money.
+
+3. Efficiency (Sharpe Ratio)
+
+   Result: Your Sharpe Ratio is 0.4601, while the Market is 0.4700.
+
+   Interpretation: The Sharpe Ratio measures "Return per unit of Risk". Even though my strategy made more money, the market was more efficient. Because my strategy's portfolio risk (30% vol) was so much higher than the market's (17% vol), my "risk-adjusted" score is lower. Although there are not a big difference in the Sharpe ratios, it can anyhow be said that my strategy generated excess returns by taking excess risk, not necessarily by arbitrage or "pure" alpha.
+
+4. Downside Risk (Max Drawdown)
+
+   Result: My strategy's portfolio risk worst decline was -35.87%.
+
+   Interpretation: This likely occurred during the 2020 Covid crash or the 2022 Bear Market (visible in your chart around Jan 2020 and Jan 2022). A 35% drop is difficult to stomach psychologically, but it is consistent with a high-beta strategy.
+
+
+# Section 8: Short Summary
+
+The XGBoost model successfully identified a high-performing subset of stocks, generating an annualized return of 18.05%, significantly outperforming the benchmark's 11.91%. However, this outperformance came with increased volatility (Beta of 1.60), resulting in a lower risk-adjusted efficiency (Sharpe Ratio of 0.46 vs 0.47). 
+
+
+
+
